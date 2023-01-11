@@ -3,7 +3,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use md5::{Digest, Md5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::errors::Error;
 use std::collections::HashMap;
@@ -111,7 +110,10 @@ where
 
 /// Send the startup packet the server. We're pretending we're a Pg client.
 /// This tells the server which user we are and what database we want.
-pub async fn startup(stream: &mut TcpStream, user: &str, database: &str) -> Result<(), Error> {
+pub async fn startup<S>(stream: &mut S, user: &str, database: &str) -> Result<(), Error>
+where
+    S: tokio::io::AsyncWrite + std::marker::Unpin,
+{
     let mut bytes = BytesMut::with_capacity(25);
 
     bytes.put_i32(196608); // Protocol number
@@ -529,4 +531,16 @@ pub fn server_parameter_message(key: &str, value: &str) -> BytesMut {
     server_info.put_bytes(0, 1);
 
     server_info
+}
+
+pub async fn ssl_request<S>(stream: &mut S) -> Result<(), Error>
+where
+    S: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    let mut bytes = BytesMut::with_capacity(8);
+
+    bytes.put_i32(8);
+    bytes.put_i32(80_877_103);
+
+    write_all(stream, bytes).await
 }

@@ -3,12 +3,16 @@
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, trace, warn};
 use std::io::Read;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
-use tokio::io::{AsyncReadExt, BufReader};
-use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-    TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::ServerName;
+use tokio_rustls::TlsConnector;
 
 use crate::config::{Address, User};
 use crate::constants::*;
@@ -17,6 +21,72 @@ use crate::messages::*;
 use crate::pool::ClientServerMap;
 use crate::scram::ScramSha256;
 use crate::stats::Reporter;
+use crate::tls::{load_certs, load_keys};
+
+enum MaybeTlsStream {
+    Tcp(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
+
+impl MaybeTlsStream {
+    pub fn split(
+        self,
+    ) -> (
+        Pin<Box<dyn AsyncRead + Send>>,
+        Pin<Box<dyn AsyncWrite + Send>>,
+    ) {
+        match self {
+            Self::Tcp(s) => {
+                let (r, w) = s.into_split();
+                (Box::pin(r), Box::pin(w))
+            }
+            Self::Tls(s) => {
+                let (r, w) = tokio::io::split(s);
+                (Box::pin(r), Box::pin(w))
+            }
+        }
+    }
+}
+
+impl AsyncRead for MaybeTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            MaybeTlsStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            MaybeTlsStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            MaybeTlsStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Server state.
 pub struct Server {
@@ -27,10 +97,10 @@ pub struct Server {
     address: Address,
 
     /// Buffered read socket.
-    read: BufReader<OwnedReadHalf>,
+    read: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
 
     /// Unbuffered write socket (our client code buffers).
-    write: OwnedWriteHalf,
+    write: Pin<Box<dyn AsyncWrite + Send>>,
 
     /// Our server response buffer. We buffer data before we give it to the client.
     buffer: BytesMut,
@@ -81,17 +151,74 @@ impl Server {
         client_server_map: ClientServerMap,
         stats: Reporter,
     ) -> Result<Server, Error> {
-        let mut stream =
-            match TcpStream::connect(&format!("{}:{}", &address.host, address.port)).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    error!("Could not connect to server: {}", err);
-                    return Err(Error::SocketError(format!(
-                        "Could not connect to server: {}",
-                        err
-                    )));
-                }
-            };
+        let mut tcp_stream = TcpStream::connect(&format!("{}:{}", address.host, address.port))
+            .await
+            .map_err(|err| Error::SocketError(format!("Could not connect to server: {}", err)))?;
+
+        let mut stream = if let (Some(cert_path), Some(key_path)) =
+            (&address.tls_certificate, &address.tls_private_key)
+        {
+            let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+
+            if let Some(root_cert_path) = &address.tls_root_certificate {
+                let file = std::fs::File::open(root_cert_path).map_err(|err| {
+                    Error::SocketError(format!("Could not read root certificate: {}", err))
+                })?;
+                let certs =
+                    rustls_pemfile::certs(&mut std::io::BufReader::new(file)).map_err(|err| {
+                        Error::SocketError(format!("Could not parse root certificate: {}", err))
+                    })?;
+                let (added, ignored) = root_store.add_parsable_certificates(&certs);
+
+                trace!("Root certificates added: {}, ignored: {}", added, ignored);
+            }
+
+            let certs = load_certs(Path::new(cert_path)).map_err(|err| {
+                Error::SocketError(format!("Could not read certificate: {}", err))
+            })?;
+
+            let keys = load_keys(Path::new(key_path)).map_err(|err| {
+                Error::SocketError(format!("Could not read private key: {}", err))
+            })?;
+
+            let first_key = keys.first().ok_or(Error::SocketError(
+                "At least one private key must be provided".to_string(),
+            ))?;
+
+            let config = tokio_rustls::rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_store)
+                .with_single_cert(certs, first_key.to_owned())
+                .map_err(|err| Error::SocketError(format!("Invalid TLS config: {}", err)))?;
+
+            let domain = ServerName::try_from(address.host.as_str())
+                .map_err(|err| Error::SocketError(format!("Invalid server name: {}", err)))?;
+
+            let connector = TlsConnector::from(Arc::new(config));
+
+            trace!("Sending SSL request");
+            ssl_request(&mut tcp_stream).await?;
+
+            let mut buf = [0];
+            tcp_stream.read_exact(&mut buf).await.map_err(|err| {
+                Error::SocketError(format!("Could not read SSL response from server: {}", err))
+            })?;
+
+            if buf[0] != b'S' {
+                return Err(Error::SocketError(
+                    "Server does not support TLS".to_string(),
+                ));
+            }
+
+            let tls_stream = connector
+                .connect(domain, tcp_stream)
+                .await
+                .map_err(|err| Error::SocketError(format!("TLS connect failed: {}", err)))?;
+
+            MaybeTlsStream::Tls(tls_stream)
+        } else {
+            MaybeTlsStream::Tcp(tcp_stream)
+        };
 
         trace!("Sending StartupMessage");
 
@@ -313,7 +440,7 @@ impl Server {
                         Err(_) => return Err(Error::SocketError(format!("Error reading transaction status message on server startup {{ username: {:?}, database: {:?} }}", user.username, database))),
                     };
 
-                    let (read, write) = stream.into_split();
+                    let (read, write) = stream.split();
 
                     let mut server = Server {
                         address: address.clone(),
@@ -684,10 +811,15 @@ impl Drop for Server {
         bytes.put_u8(b'X');
         bytes.put_i32(4);
 
-        match self.write.try_write(&bytes) {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(self.write.write_all(&bytes))
+        {
             Ok(_) => (),
             Err(_) => debug!("Dirty shutdown"),
-        };
+        }
 
         // Should not matter.
         self.bad = true;

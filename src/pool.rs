@@ -203,6 +203,9 @@ impl ConnectionPool {
                             shard: shard_idx.parse::<usize>().unwrap(),
                             username: user.username.clone(),
                             pool_name: pool_name.clone(),
+                            tls_certificate: shard.tls_certificate.clone(),
+                            tls_private_key: shard.tls_private_key.clone(),
+                            tls_root_certificate: shard.tls_root_certificate.clone(),
                         };
 
                         address_id += 1;

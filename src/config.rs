@@ -88,6 +88,10 @@ pub struct Address {
 
     /// The name of this pool (i.e. database name visible to the client).
     pub pool_name: String,
+
+    pub tls_certificate: Option<String>,
+    pub tls_private_key: Option<String>,
+    pub tls_root_certificate: Option<String>,
 }
 
 impl Default for Address {
@@ -103,6 +107,9 @@ impl Default for Address {
             role: Role::Replica,
             username: String::from("username"),
             pool_name: String::from("pool_name"),
+            tls_certificate: None,
+            tls_private_key: None,
+            tls_root_certificate: None,
         }
     }
 }
@@ -370,6 +377,9 @@ pub struct ServerConfig {
 pub struct Shard {
     pub database: String,
     pub servers: Vec<ServerConfig>,
+    pub tls_certificate: Option<String>,
+    pub tls_private_key: Option<String>,
+    pub tls_root_certificate: Option<String>,
 }
 
 impl Shard {
@@ -419,6 +429,9 @@ impl Default for Shard {
                 role: Role::Primary,
             }],
             database: String::from("postgres"),
+            tls_certificate: None,
+            tls_private_key: None,
+            tls_root_certificate: None,
         }
     }
 }
